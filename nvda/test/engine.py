@@ -65,6 +65,15 @@ VOICE_NAMES = {
 #: What a fresh instance's voice is set to, as the engine really answers it.
 VOICE_PARAMS = {0: 0, 1: 50, 2: 65, 3: 30, 4: 0, 5: 0, 6: 50, 7: 92}
 
+#: What each of the eight presets is set to. The real engine answers for a
+#: preset when asked for voices one to eight and for the voice in force when
+#: asked for voice nought, and a copy makes the second the first.
+PRESETS = {
+    n: {0: n % 2, 1: 40 + n, 2: 50 + 5 * n, 3: 30 + n,
+        4: n, 5: 2 * n, 6: 100 + 3 * n, 7: 90 + n}
+    for n in range(1, 9)
+}
+
 HANDLE = 0x1234567890AB
 
 
@@ -133,7 +142,12 @@ class FakeDll:
             args[2].value = VOICE_NAMES[args[1]]
             return 1
         if name == "eciGetVoiceParam":
+            if args[1] != 0:
+                return PRESETS[args[1]][args[2]]
             return self.voiceParams[args[2]]
+        if name == "eciCopyVoice":
+            self.voiceParams.update(PRESETS[args[1]])
+            return 1
         if name == "eciSetVoiceParam":
             was = self.voiceParams[args[2]]
             self.voiceParams[args[2]] = args[3]
@@ -774,6 +788,106 @@ def main():
           [VOICE_NAMES[n].decode() for n in range(1, 9)])
     check("it reads the voice's settings so the driver need not ask across threads",
           engine.voiceParams, VOICE_PARAMS)
+    check("it reads what each preset is set to, from the presets themselves",
+          engine.presetParamsByLanguage, {0x10000: PRESETS})
+    check("and does not copy one over the voice in force to find out",
+          dll.named("eciCopyVoice"), [])
+
+    # What a voice will leave behind is answered for before the engine's
+    # thread has copied it, and the copy then agrees.
+    engine.voiceParams.update(PRESETS[1])
+    engine.expectVoice(0x10000, 2)
+    check("a voice chosen is answered for at once, before it is copied",
+          engine.voiceParams, PRESETS[2])
+    engine.copyVoice(2)
+    check("and the copy leaves the same",
+          engine.voiceParams, PRESETS[2])
+    engine.expectVoice(0x10000, 99)
+    engine.expectVoice(0x99999, 3)
+    check("a voice or language it has not read changes nothing",
+          engine.voiceParams, PRESETS[2])
+    engine.copyVoice(1)
+
+    # ---- the reader's speed, pitch and inflection survive a voice ---------
+    #
+    # Choosing a voice copies a preset over the voice in force, which would
+    # set the rate the reader chose to the voice's own. Those three are moved
+    # by how far the new preset differs from the old instead; the rest of the
+    # voice is the preset's.
+    SPEED, PITCH, FLUCT = mod.VOICE_SPEED, mod.VOICE_PITCH, mod.VOICE_FLUCTUATION
+    OWN = {SPEED: 140, PITCH: 70, FLUCT: 20}
+
+    def reader_has(**_):
+        # The engine's own state and the mirror the driver reads, which
+        # agree when nothing is in flight.
+        for params in (engine.voiceParams, dll.voiceParams):
+            params.update(PRESETS[1])
+            params.update(OWN)
+        engine.presetInForce = (0x10000, 1)
+        engine._presetExpected = (0x10000, 1)
+
+    def three():
+        return {w: engine.voiceParams[w] for w in OWN}
+
+    reader_has()
+    engine.selectVoice(2)
+    want = {w: OWN[w] + PRESETS[2][w] - PRESETS[1][w] for w in OWN}
+    check("a voice moves the reader's speed, pitch and inflection by the"
+          " difference between the presets", three(), want)
+    check("and the rest of it is the preset's",
+          {w: engine.voiceParams[w] for w in (0, 1, 4, 5, 7)},
+          {w: PRESETS[2][w] for w in (0, 1, 4, 5, 7)})
+    check("the engine was told the same, not only the mirror",
+          {w: dll.voiceParams[w] for w in OWN}, want)
+    engine.selectVoice(5)
+    engine.selectVoice(1)
+    check("going on to another voice and back leaves them where they were",
+          three(), OWN)
+
+    reader_has()
+    engine.selectVoice(1)
+    check("choosing the voice already in force leaves them alone",
+          three(), OWN)
+
+    reader_has()
+    engine.expectVoice(0x10000, 2)
+    told = dict(engine.voiceParams)
+    engine.selectVoice(2)
+    check("what the driver was told a voice would leave is what it leaves",
+          told, dict(engine.voiceParams))
+
+    # A boosted speed is already several times what the slider says, so the
+    # difference between voices is divided by the boost and not multiplied:
+    # at four, a voice twelve faster than the last goes three faster.
+    # Presets one and five are twelve apart, and nothing else is divided.
+    reader_has()
+    engine.selectVoice(5, rateBoost=4)
+    check("a rate boost divides the difference in speed and in nothing else",
+          three(),
+          {SPEED: 140 + 12 // 4,
+           PITCH: OWN[PITCH] + PRESETS[5][PITCH] - PRESETS[1][PITCH],
+           FLUCT: OWN[FLUCT] + PRESETS[5][FLUCT] - PRESETS[1][FLUCT]})
+    check("which is what the driver was told it would be",
+          PRESETS[5][SPEED] - PRESETS[1][SPEED], 12)
+    reader_has()
+    engine.expectVoice(0x10000, 5, 4)
+    told = dict(engine.voiceParams)
+    engine.selectVoice(5, rateBoost=4)
+    check("and the mirror agrees under a boost", told, dict(engine.voiceParams))
+
+    reader_has()
+    engine.voiceParams[PITCH] = dll.voiceParams[PITCH] = 98
+    engine.selectVoice(8)
+    check("and what comes out is held to what the engine takes",
+          engine.voiceParams[PITCH], 100)
+
+    engine.voiceParams.update(PRESETS[1])
+    dll.voiceParams.update(PRESETS[1])
+    engine.presetInForce = (0x10000, 1)
+    engine.selectVoice(3)
+    check("a reader who has changed nothing gets exactly the preset",
+          dict(engine.voiceParams), PRESETS[3])
+    engine.selectVoice(1)
     check("the player is made at the engine's own rate, one channel, sixteen bits",
           (players[0].made["samplesPerSec"], players[0].made["channels"],
            players[0].made["bitsPerSample"]),

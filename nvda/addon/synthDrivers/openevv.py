@@ -724,16 +724,21 @@ class SynthDriver(SynthDriver):
 			return
 
 		self._voice = self._voiceId(language, number)
-		# Copying a preset over the voice in force replaces every one of its
-		# eight settings, so whatever the reader had chosen is gone; NVDA sets
-		# rate, pitch and the rest again after a voice change, which is what
-		# puts them back. A language change does the same thing for the same
-		# reason, which is why the preset is copied after it and not before.
-		batch = []
-		if language != self._engine.language:
-			batch.append((self._engine.setLanguage, (language,)))
-		batch.append((self._engine.copyVoice, (number,)))
-		self._engine.control(batch)
+		# Choosing a voice brings the voice's own volume, head size, roughness
+		# and breathiness, and moves the reader's speed, pitch and inflection
+		# by how far the voice differs from the last, not to the voice's own:
+		# someone who has set the rate to what suits them keeps it. NVDA does
+		# not set any of them again after a voice change; its dialog reads
+		# them back at once, so they have to be answered for now and not when
+		# the engine's thread has done the copy. The language, where the voice
+		# names a different one, is changed to in the same step, for the same
+		# reason the preset is copied after it and not before: a language
+		# change replaces the voice in force.
+		boost = RATE_BOOST if self._rateBoost else 1
+		self._engine.expectVoice(language, number, boost)
+		self._engine.control(
+			[(self._engine.selectVoice, (number, language, boost))]
+		)
 
 	def _get_language(self):
 		return _openevv.localeOf(self._engine.language)

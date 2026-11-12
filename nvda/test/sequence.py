@@ -277,7 +277,19 @@ class FakeEngine:
         }
         self.voiceNames = self.voiceNamesByLanguage[self.language]
         self.voiceParams = {0: 0, 1: 50, 2: 65, 3: 30, 4: 0, 5: 0, 6: 50, 7: 92}
+        #: What each preset is set to, which the real engine reads once on
+        #: the way in. Different in every preset, so that a driver which
+        #: answers for the wrong one, or for none, cannot pass by luck.
+        self.presetParamsByLanguage = {
+            language: {
+                n: {0: n % 2, 1: 40 + n, 2: 50 + 5 * n, 3: 30 + n,
+                    4: n, 5: 2 * n, 6: 100 + 3 * n, 7: 90 + n}
+                for n in range(1, 9)
+            }
+            for language in self.languages
+        }
         self.version = "test"
+        self._presetExpected = (self.language, 1)
         self.player = None
         self.pauseMode = 1
         #: Whether each batch arrived as speech or as a setting.
@@ -300,6 +312,9 @@ class FakeEngine:
             if name in ("setLanguage", "selectLanguage"):
                 self.language = args[0]
                 self.voiceNames = self.voiceNamesByLanguage[args[0]]
+            if name == "selectVoice":
+                self.language = args[1]
+                self.voiceNames = self.voiceNamesByLanguage[args[1]]
 
     def control(self, batch):
         # A control step runs the same way as speech here; what the driver is
@@ -339,6 +354,13 @@ class FakeEngine:
     def copyVoice(self, number):
         pass
 
+    def selectVoice(self, number, language=None, rateBoost=1):
+        pass
+
+    # expectVoice is the engine layer's own, assigned in driver(): the
+    # arithmetic of how a voice moves the reader's settings is what the
+    # driver depends on, and a copy of it written here would test the copy.
+
     def setLanguage(self, language):
         pass
 
@@ -365,6 +387,10 @@ def driver():
     global _openevv
     _openevv = engine_module
 
+    real = engine_module.Engine
+    FakeEngine.expectVoice = real.expectVoice
+    FakeEngine._preset = real._preset
+    FakeEngine._carried = staticmethod(real._carried)
     engine_module.Engine = FakeEngine
     return driver_module.SynthDriver()
 
@@ -760,13 +786,95 @@ def main():
     d._engine.calls = []
     d.voice = "4"
     check("choosing a voice copies that preset over the one in force",
-          d._engine.calls, [("copyVoice", 4)])
+          d._engine.calls, [("selectVoice", 4, 0x10000, 1)])
     check("and the driver remembers which it is", d.voice, "4")
 
     d._engine.calls = []
     d.voice = "99"
     check("a voice the engine does not have is refused rather than passed on",
           (d._engine.calls, d.voice), ([], "4"))
+
+    # NVDA's dialog reads every setting back the moment the voice is set,
+    # while the copy is still a step on the engine's queue. The posted copy
+    # never runs here, so anything the driver answers beyond the old voice's
+    # numbers it was told about by the voice being chosen.
+    d.voice = "1"
+    d._engine.voiceParams.update(d._engine.presetParamsByLanguage[0x10000][1])
+    d.voice = "2"
+    check("a voice's own pitch, inflection, volume and head size are answered"
+          " at once, before the engine has copied it",
+          (d.pitch, d.inflection, d.volume, d.headSize),
+          (60, 32, 92, 42))
+    check("and its roughness and breathiness",
+          (d.roughness, d.breathiness), (2, 4))
+    d.voice = "6"
+    check("and the next voice's, not the first's",
+          (d.pitch, d.inflection, d.volume, d.headSize, d.roughness,
+           d.breathiness),
+          (80, 36, 96, 46, 6, 12))
+    d.voice = "99"
+    check("a voice the engine does not have changes none of them",
+          (d.pitch, d.volume), (80, 96))
+
+    # ---- speed, pitch and inflection are the reader's -----------------------
+    #
+    # Someone who has set the rate to what suits them does not want it set
+    # again to the voice's own each time they try another voice. The three
+    # move by how far the new preset differs from the old and nothing else
+    # does: volume, head size, roughness and breathiness are the voice's.
+    P = d._engine.presetParamsByLanguage[0x10000]
+    d.voice = "1"
+    d._engine.voiceParams.update(P[1])
+    d._engine.voiceParams[_openevv.VOICE_PITCH] = 70
+    d._engine.voiceParams[_openevv.VOICE_FLUCTUATION] = 20
+    d._engine.voiceParams[_openevv.VOICE_SPEED] = 140
+    d.voice = "2"
+    check("a voice that differs moves the reader's pitch, inflection and"
+          " speed by the difference",
+          (d._engine.voiceParams[_openevv.VOICE_PITCH],
+           d._engine.voiceParams[_openevv.VOICE_FLUCTUATION],
+           d._engine.voiceParams[_openevv.VOICE_SPEED]),
+          (70 + P[2][2] - P[1][2], 20 + P[2][3] - P[1][3],
+           140 + P[2][6] - P[1][6]))
+    check("and the volume, head size, roughness and breathiness are the"
+          " voice's own",
+          [d._engine.voiceParams[w] for w in (7, 1, 4, 5)],
+          [P[2][w] for w in (7, 1, 4, 5)])
+    d.voice = "6"
+    d.voice = "1"
+    check("going to another voice and back leaves them where they were",
+          (d._engine.voiceParams[_openevv.VOICE_PITCH],
+           d._engine.voiceParams[_openevv.VOICE_FLUCTUATION],
+           d._engine.voiceParams[_openevv.VOICE_SPEED]),
+          (70, 20, 140))
+    check("and the rate NVDA shows is the reader's, not the preset's",
+          d.rate, d._paramToPercent(140, 40, 156))
+    d.voice = "1"
+    check("choosing the voice already in force changes nothing",
+          (d._engine.voiceParams[_openevv.VOICE_PITCH],
+           d._engine.voiceParams[_openevv.VOICE_SPEED]), (70, 140))
+
+    d._rateBoost = True
+    d.voice = "2"
+    # The two presets differ by 3 in speed and the boost is 1.6: divided,
+    # that is 1.9 and the speed 142; multiplied it would be 4.8 and 145.
+    check("with the rate boost on the difference is divided by the boost,"
+          " not multiplied by it, so a slow setting is not made fast",
+          d._engine.voiceParams[_openevv.VOICE_SPEED], 142)
+    check("and the step posted carries the boost it was chosen under",
+          d._engine.calls[-1], ("selectVoice", 2, 0x10000, 1.6))
+    d._rateBoost = False
+    d.voice = "1"
+    d._engine.voiceParams[_openevv.VOICE_PITCH] = 98
+    d.voice = "8"
+    check("and is held to what the engine takes",
+          d._engine.voiceParams[_openevv.VOICE_PITCH], 100)
+
+    d._engine.calls = []
+    d.voice = "5"
+    check("the step posted is one selectVoice, with the boost it was chosen under",
+          d._engine.calls, [("selectVoice", 5, 0x10000, 1)])
+    d.voice = "4"
 
     d._engine.calls = []
     d.abbreviations = True
@@ -941,12 +1049,12 @@ def main():
         d.voice = "262144:5"
         check("choosing a voice of another language changes both",
               d._engine.calls,
-              [("setLanguage", 0x40000), ("copyVoice", 5)])
+              [("selectVoice", 5, 0x40000, 1)])
 
         d._engine.calls = []
         d.voice = "262144:2"
         check("and staying in that language changes only the preset",
-              d._engine.calls, [("copyVoice", 2)])
+              d._engine.calls, [("selectVoice", 2, 0x40000, 1)])
 
         check("a voice of a language the library has not is refused",
               (d.voice, spoken(d, [])) and d.voice, "262144:2")

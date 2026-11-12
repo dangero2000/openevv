@@ -198,6 +198,75 @@ def main():
               passes[1], passes[0])
         engine.setLanguage(engine.languages[0])
 
+    # ---- a voice keeps the reader's speed, pitch and inflection -----------
+    #
+    # NVDA's dialog reads every setting back the moment a voice is chosen,
+    # while the choice is a step on the engine's own queue, so what the driver
+    # answers then has to be what the step leaves. And what it leaves has to
+    # be the reader's own speed, pitch and inflection moved by how far the new
+    # preset differs from the old, not the preset's -- for every preset of
+    # every language, since the table read once on the way in is only good if
+    # it is the engine's own answer.
+    home = engine.languages[0]
+    ours = (mod.VOICE_SPEED, mod.VOICE_PITCH, mod.VOICE_FLUCTUATION)
+    reader = {mod.VOICE_SPEED: 130, mod.VOICE_PITCH: 77,
+              mod.VOICE_FLUCTUATION: 15}
+    wrong = []
+    for language in engine.languages:
+        presets = engine.presetParamsByLanguage[language]
+        base = engine.presetParamsByLanguage[home][mod.VOICE_FIRST]
+        for number in sorted(engine.voiceNamesFor(language)):
+            engine.selectVoice(mod.VOICE_FIRST, home)
+            engine._presetExpected = engine.presetInForce
+            for which, value in reader.items():
+                engine.setVoiceParam(which, value)
+            engine.expectVoice(language, number)
+            told = dict(engine.voiceParams)
+            engine.selectVoice(number, language)
+            real = {which: engine.getVoiceParam(which)
+                    for which in mod.VOICE_RANGE}
+            want = dict(presets[number])
+            for which in ours:
+                lo, hi = mod.VOICE_RANGE[which]
+                want[which] = max(lo, min(
+                    reader[which] + presets[number][which] - base[which], hi))
+            if not (told == engine.voiceParams == real == want):
+                wrong.append((mod.nameOf(language), number))
+    check("a voice moves the reader's speed, pitch and inflection by the"
+          " difference between presets and brings its own volume, head size,"
+          " roughness and breathiness, as the driver was told it would,"
+          " in every preset of every language", wrong, [])
+
+    engine.selectVoice(mod.VOICE_FIRST, home)
+    for which, value in reader.items():
+        engine.setVoiceParam(which, value)
+    for language in engine.languages[:3]:
+        engine.selectVoice(5, language)
+    engine.selectVoice(mod.VOICE_FIRST, home)
+    check("going through other voices and languages and back leaves them"
+          " where the reader had them",
+          {which: engine.getVoiceParam(which) for which in ours}, reader)
+
+    # Under the rate boost the difference in speed is divided by it, not
+    # multiplied, and the driver's answer agrees with the engine's.
+    engine.selectVoice(mod.VOICE_FIRST, home)
+    engine._presetExpected = engine.presetInForce
+    for which, value in reader.items():
+        engine.setVoiceParam(which, value)
+    first = engine.presetParamsByLanguage[home]
+    engine.expectVoice(home, 5, 1.6)
+    told = engine.voiceParams[mod.VOICE_SPEED]
+    engine.selectVoice(5, home, 1.6)
+    check("a voice's difference in speed is divided by the rate boost,"
+          " as the driver was told it would be",
+          (told, engine.getVoiceParam(mod.VOICE_SPEED)),
+          (int(round(130 + (first[5][mod.VOICE_SPEED]
+                            - first[1][mod.VOICE_SPEED]) / 1.6)),) * 2)
+
+    # And the voice put back as it was found, for everything after this.
+    engine.setLanguage(home)
+    engine.copyVoice(mod.VOICE_FIRST)
+
     # ---- an index mark lands where it should ------------------------------
 
     player.chunks = []

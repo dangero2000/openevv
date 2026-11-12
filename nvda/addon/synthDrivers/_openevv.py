@@ -167,6 +167,14 @@ VOICE_RANGE = {
 	VOICE_VOLUME: (0, 100),
 }
 
+#: The three a reader sets to suit themselves and expects to keep when the
+#: voice changes: how fast, how high, and how much the pitch moves. Choosing a
+#: voice moves each of them by how far the new preset differs from the one
+#: before it and does not set them to the preset's own. The rest -- volume,
+#: head size, roughness, breathiness -- are what make the voice that voice,
+#: and are the preset's.
+RELATIVE_VOICE_PARAMS = (VOICE_SPEED, VOICE_PITCH, VOICE_FLUCTUATION)
+
 # What is on the queue: an utterance, which is dropped if silence has been
 # asked for since it was put there, or a control step, which is not.
 SPEECH = 0
@@ -491,6 +499,17 @@ class Engine:
 		self.language = None
 		#: The eight presets of each language, read once on the way in.
 		self.voiceNamesByLanguage = {}
+		#: And what each of them is set to, so that the driver can answer
+		#: for a voice the moment it is chosen, before the engine's thread
+		#: has got to copying it. See expectVoice.
+		self.presetParamsByLanguage = {}
+		#: Which preset the voice in force was last copied from, as
+		#: (language, number). What a choice of voice is measured against.
+		#: Written by the engine's thread. expectVoice keeps its own, because
+		#: it runs ahead of that thread and has to be measured against the
+		#: choice before it and not against whatever the thread has reached.
+		self.presetInForce = None
+		self._presetExpected = None
 		self.version = ""
 		#: What each of the eight settings of the voice in force is, kept here
 		#: so that the driver can answer a settings dialog without calling
@@ -810,6 +829,98 @@ class Engine:
 		if not self._dll.eciCopyVoice(self._instance, number, 0):
 			log.debugWarning("openevv: the engine refused voice %d" % number)
 		self._readVoiceParams()
+		self.presetInForce = (self.language, number)
+
+	def selectVoice(self, number, language=None, rateBoost=1):
+		"""Speak in a voice the reader has chosen, keeping the reader's own
+		speed, pitch and inflection.
+
+		Copying a preset over the voice in force replaces all eight of its
+		settings. Someone who has set the rate to what suits them does not
+		want it set again to the voice's own each time they try another voice,
+		so those three are put back where they were, moved by how far the new
+		preset differs from the one before it: a voice that speaks twenty
+		faster than the last goes twenty faster than the reader's rate, and
+		going back goes back. A reader who has changed nothing gets exactly
+		the preset, since there is then no difference to carry over. The
+		voice's own volume, head size, roughness and breathiness are the
+		preset's.
+
+		`rateBoost` is what the add-on's rate boost multiplies the speed by,
+		and one where it is off. A boosted speed is already several times
+		what the slider says, so a voice's difference is divided by the boost
+		rather than carried over whole, which would take a slow setting to an
+		unintelligible one: with the boost at four, a voice twenty faster
+		than the last goes five faster. A language named here is changed to
+		first, in this one step, so that the settings measured against are the
+		reader's and not the new language's default voice's.
+		"""
+		# Asked of the engine and not read from voiceParams, which expectVoice
+		# has already moved to where this is about to put them: measured
+		# against that, the difference would be carried twice.
+		before = {w: self.getVoiceParam(w) for w in RELATIVE_VOICE_PARAMS}
+		old = self._preset(*self.presetInForce) if self.presetInForce else None
+		if language is not None and language != self.language:
+			self.setLanguage(language)
+		new = self._preset(self.language, number)
+		self.copyVoice(number)
+		if old is not None and new is not None:
+			for which, value in self._carried(before, old, new, rateBoost).items():
+				self.setVoiceParam(which, value)
+
+	def expectVoice(self, language, number, rateBoost=1):
+		"""Answer for a voice that has been chosen and not yet copied.
+
+		Called on the reader's thread, which is not the engine's. Choosing a
+		voice is a step on the engine's queue, so the settings it brings --
+		pitch, inflection, volume, head size, roughness, breathiness and the
+		speed -- are the old voice's until the thread gets to it, and NVDA's
+		dialog reads them straight back the moment the voice is set. It showed
+		Adult Male 1's pitch, volume and breathiness for Adult Female 1, or
+		not, depending on which thread was first.
+
+		The presets do not change, so what the step will leave is known now,
+		by the same arithmetic as selectVoice, and this puts it where the
+		driver reads. The step itself still runs, in its place in the queue,
+		and reads the engine's own answer over it.
+		"""
+		new = self._preset(language, number)
+		if new is None:
+			return
+		old = self._preset(*self._presetExpected) if self._presetExpected else None
+		settings = dict(new)
+		if old is not None:
+			settings.update(
+				self._carried(self.voiceParams, old, new, rateBoost)
+			)
+		self.voiceParams.update(settings)
+		self._presetExpected = (language, number)
+
+	def _preset(self, language, number):
+		return self.presetParamsByLanguage.get(language, {}).get(number)
+
+	def _presetMatching(self):
+		"""Which preset of the language in force the voice in force is, or the
+		first where it is none of them. A new instance is in one of them, and
+		so is a language that has just been changed to."""
+		for number, preset in self.presetParamsByLanguage.get(
+				self.language, {}).items():
+			if all(self.voiceParams.get(w) == v for w, v in preset.items()):
+				return number
+		return VOICE_FIRST
+
+	@staticmethod
+	def _carried(current, old, new, rateBoost):
+		"""The settings that stay the reader's, each moved by what the new
+		preset differs from the old by, and held to what the engine takes."""
+		carried = {}
+		for which in RELATIVE_VOICE_PARAMS:
+			step = new[which] - old[which]
+			if which == VOICE_SPEED:
+				step = step / rateBoost
+			lo, hi = VOICE_RANGE[which]
+			carried[which] = max(lo, min(int(round(current[which] + step)), hi))
+		return carried
 
 	def setLanguage(self, language):
 		"""Speak another of the languages the library has.
@@ -828,6 +939,7 @@ class Engine:
 		self._useDictionary(language)
 		self._readVoiceNames()
 		self._readVoiceParams()
+		self.presetInForce = (language, self._presetMatching())
 		return True
 
 	def selectLanguage(self, language, preset):
@@ -980,6 +1092,22 @@ class Engine:
 	def _readVoiceParams(self):
 		for which in VOICE_RANGE:
 			self.voiceParams[which] = self.getVoiceParam(which)
+
+	def _presetParams(self):
+		"""What each of the language in force's presets is set to.
+
+		Asked of the presets themselves, voices one to eight, and not by
+		copying each over the voice in force: the engine answers for a
+		preset exactly as it does for the copy of it, and a preset is left
+		alone by anything done to the voice in force.
+		"""
+		return {
+			number: {
+				which: self._dll.eciGetVoiceParam(self._instance, number, which)
+				for which in VOICE_RANGE
+			}
+			for number in range(VOICE_FIRST, VOICE_LAST + 1)
+		}
 
 	def _resume(self):
 		self._held = bytearray()
@@ -1194,11 +1322,14 @@ class Engine:
 			if language != self.language:
 				dll.eciSetParam(handle, PARAM_LANGUAGE, language)
 			self.voiceNamesByLanguage[language] = self._voiceNames()
+			self.presetParamsByLanguage[language] = self._presetParams()
 		if len(self.languages) > 1:
 			dll.eciSetParam(handle, PARAM_LANGUAGE, self.language)
 		self.voiceNames = self.voiceNamesByLanguage[self.language]
 
 		self._readVoiceParams()
+		self.presetInForce = (self.language, self._presetMatching())
+		self._presetExpected = self.presetInForce
 
 		self.player = self._newPlayer(self.sampleRate)
 
