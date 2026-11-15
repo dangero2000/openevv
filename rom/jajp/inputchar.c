@@ -618,11 +618,19 @@ void ic_ConvertDakuten(void *in, int16_t at, uint8_t c, uint8_t mark)
 /* One single-byte letter, digit or symbol, written as the full-width form the
  * yomi table holds for it.
  *
- * A comma or a full stop at the very start of a sentence is not a character at
- * all: it is what the sentence before ended on, arriving late, so the reader
- * is told to give up on this one and the mark is kept for the caller. Anywhere
- * else the two bytes go in unchanged rather than as the full-width form, which
- * is what the second copy is for. */
+ * A mark at the very start of a sentence is not a character at all: it is what
+ * the sentence before ended on, arriving late, so the reader is told to give up
+ * on this one and the mark is kept for the caller. Anywhere else the full-width
+ * form is copied back into the pair the reader's loop tests at the top of every
+ * turn, which is what lets the mark end the sentence, and is what the second
+ * copy is for.
+ *
+ * IBM's reader does both for the comma and the full stop only. A half-width
+ * question mark or exclamation mark therefore never ended a sentence: the yomi
+ * table had made it the full-width one, but the loop was never shown it, so
+ * the sentence ran on and ended as a statement. Ours shows the loop those two
+ * as well, so that `?' and `!' do what the full-width marks do. That is a
+ * deliberate divergence, and docs/quirks.md has it. */
 int16_t ic_ProcessASCII(void *in, int16_t at, uint8_t *c0, uint8_t *c1)
 {
     uint8_t i = (uint8_t)(*c0 - 0x21);
@@ -632,7 +640,7 @@ int16_t ic_ProcessASCII(void *in, int16_t at, uint8_t *c0, uint8_t *c1)
     IC_MARK_AT(in, at) = IC_L(in, IC_POS) - 1;
     IC_OFFSET_AT(in, at) = IC_W(in, IC_RAWPOS);
 
-    if (*c0 == ',' || *c0 == '.') {
+    if (*c0 == ',' || *c0 == '.' || *c0 == '?' || *c0 == '!') {
         if (at == 0) {
             IC_W(in, IC_COUNT) = at;
             IC_L(in, IC_ENDED) = 1;
